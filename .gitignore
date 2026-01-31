@@ -1,0 +1,17 @@
+# BARF runtime files
+.barf/
+.barf.yaml
+
+# Generated plans directory (optional - some may want to track)
+# plans/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
