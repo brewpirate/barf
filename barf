@@ -1,0 +1,1270 @@
+#!/usr/bin/env bash
+#
+# BARF - Build And Run Framework
+# Issue-Driven Autonomous Development based on the Ralph Playbook
+#
+
+set -euo pipefail
+
+# Version
+BARF_VERSION="0.1.0"
+
+# Colors (disabled with --quiet or when not a tty)
+if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'
+    MAGENTA='\033[0;35m'
+    CYAN='\033[0;36m'
+    BOLD='\033[1m'
+    DIM='\033[2m'
+    NC='\033[0m' # No Color
+else
+    RED='' GREEN='' YELLOW='' BLUE='' MAGENTA='' CYAN='' BOLD='' DIM='' NC=''
+fi
+
+# Globals
+VERBOSE=0
+QUIET=0
+DRY_RUN=0
+PARALLEL=0
+MODEL=""
+PLANS_DIR="plans"
+TEMPLATES_DIR="${BARF_TEMPLATES_DIR:-$HOME/.barf/templates}"
+ISSUES_DIR="issues"
+
+# Logging functions
+log_info() {
+    [[ $QUIET -eq 1 ]] && return
+    echo -e "${BLUE}ℹ${NC} $*"
+}
+
+log_success() {
+    [[ $QUIET -eq 1 ]] && return
+    echo -e "${GREEN}✓${NC} $*"
+}
+
+log_warning() {
+    echo -e "${YELLOW}⚠${NC} $*" >&2
+}
+
+log_error() {
+    echo -e "${RED}✗${NC} $*" >&2
+}
+
+log_verbose() {
+    [[ $VERBOSE -eq 0 ]] && return
+    echo -e "${DIM}  $*${NC}"
+}
+
+log_debug() {
+    [[ $VERBOSE -lt 2 ]] && return
+    echo -e "${DIM}[DEBUG] $*${NC}"
+}
+
+log_dry_run() {
+    echo -e "${MAGENTA}[DRY-RUN]${NC} $*"
+}
+
+# Print section header
+print_header() {
+    [[ $QUIET -eq 1 ]] && return
+    echo ""
+    echo -e "${BOLD}$*${NC}"
+    echo -e "${DIM}$(printf '%.0s─' {1..50})${NC}"
+}
+
+# Usage/Help
+show_usage() {
+    cat << EOF
+${BOLD}BARF${NC} - Build And Run Framework v${BARF_VERSION}
+Issue-Driven Autonomous Development based on the Ralph Playbook
+
+${BOLD}USAGE:${NC}
+    barf [OPTIONS] <COMMAND> [ARGS...]
+
+${BOLD}COMMANDS:${NC}
+    interview <issue>        Clarify ambiguities in an issue
+    plan <issue> [max_iter]  Generate implementation plan
+    build <issue> [max_iter] Autonomously implement from plan
+    audit                    Verify quality and compliance
+    new <type> <title>       Create new issue from template
+    dashboard                Show progress dashboard
+
+${BOLD}OPTIONS:${NC}
+    -m, --model <MODEL>      Use specific Claude model (opus, sonnet, haiku)
+    -n, --dry-run            Show what would happen without executing
+    -v, --verbose            Increase output verbosity (use -vv for debug)
+    -q, --quiet              Suppress non-essential output
+    -p, --parallel           Process sub-issues in parallel (for plan)
+    -h, --help               Show this help message
+    --version                Show version information
+
+${BOLD}EXAMPLES:${NC}
+    barf interview 42              # Clarify issue #42
+    barf plan 42                   # Plan issue #42 (unlimited iterations)
+    barf plan 42 5                 # Plan with max 5 iterations
+    barf plan 42 --dry-run         # Show what plan would do
+    barf plan big-feature -p       # Plan with parallel sub-issue processing
+    barf build 42 20               # Build with max 20 iterations
+    barf build 42 --dry-run        # Show next task without implementing
+    barf -m sonnet build 42        # Use Sonnet model for speed
+    barf new feature "Add auth"    # Create feature issue from template
+    barf new bug "Fix login"       # Create bug issue from template
+    barf dashboard                 # Show progress dashboard
+
+${BOLD}VERBOSITY LEVELS:${NC}
+    (default)   Standard output - progress and results
+    -q          Quiet - only errors and final results
+    -v          Verbose - include detailed progress info
+    -vv         Debug - include internal debugging info
+
+${BOLD}DRY-RUN MODE:${NC}
+    Shows what would happen without making changes:
+    - plan --dry-run:  Show Claude prompt and planned approach
+    - build --dry-run: Show next task without implementing
+
+${BOLD}DOCUMENTATION:${NC}
+    https://github.com/brewpirate/barf
+
+EOF
+}
+
+show_version() {
+    echo "barf version $BARF_VERSION"
+}
+
+# Check dependencies
+check_dependencies() {
+    local missing=()
+
+    if ! command -v claude &> /dev/null; then
+        missing+=("claude (Claude CLI)")
+    fi
+
+    if ! command -v gh &> /dev/null; then
+        missing+=("gh (GitHub CLI)")
+    fi
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_error "Missing required dependencies:"
+        for dep in "${missing[@]}"; do
+            echo "  - $dep"
+        done
+        echo ""
+        echo "Install Claude CLI: https://github.com/anthropics/anthropic-claude-cli"
+        echo "Install GitHub CLI: https://cli.github.com/"
+        exit 1
+    fi
+
+    log_verbose "All dependencies found"
+}
+
+# Ensure directories exist
+ensure_dirs() {
+    mkdir -p "$PLANS_DIR"
+    mkdir -p "$ISSUES_DIR"
+    log_verbose "Ensured directories: $PLANS_DIR, $ISSUES_DIR"
+}
+
+# Build Claude command with options
+build_claude_cmd() {
+    local cmd="claude"
+
+    if [[ -n "$MODEL" ]]; then
+        cmd+=" --model $MODEL"
+    fi
+
+    # Add dangerously-skip-permissions for autonomous operation
+    cmd+=" --dangerously-skip-permissions"
+
+    echo "$cmd"
+}
+
+# Fetch issue details
+fetch_issue() {
+    local issue="$1"
+    log_verbose "Fetching issue: $issue"
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log_dry_run "Would fetch issue #$issue using: gh issue view $issue"
+        return 0
+    fi
+
+    gh issue view "$issue" --json number,title,body,comments,labels,state
+}
+
+# ============================================================================
+# INTERVIEW COMMAND
+# ============================================================================
+cmd_interview() {
+    local issue="${1:-}"
+
+    if [[ -z "$issue" ]]; then
+        log_error "Missing required argument: <issue>"
+        echo "Usage: barf interview <issue>"
+        exit 1
+    fi
+
+    print_header "Interview Mode - Issue #$issue"
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log_dry_run "Would analyze issue #$issue for ambiguities"
+        log_dry_run "Would prompt Claude with:"
+        cat << EOF
+
+${CYAN}--- Claude Prompt ---${NC}
+Analyze issue #$issue for ambiguities and missing details.
+
+Instructions:
+1. Fetch the issue using: gh issue view $issue
+2. Identify unclear acceptance criteria
+3. Find missing technical constraints
+4. Discover undefined edge cases
+5. Clarify implementation approach decisions
+6. Ask clarifying questions interactively
+7. Update issue with clarifications as comments
+
+Focus on making the issue implementable without guesswork.
+${CYAN}--- End Prompt ---${NC}
+
+EOF
+        return 0
+    fi
+
+    check_dependencies
+    ensure_dirs
+
+    local claude_cmd
+    claude_cmd=$(build_claude_cmd)
+
+    log_info "Analyzing issue #$issue for ambiguities..."
+    log_verbose "Using command: $claude_cmd"
+
+    local prompt
+    prompt=$(cat << EOF
+Analyze GitHub issue #$issue for ambiguities and missing details.
+
+First, fetch the issue: gh issue view $issue
+
+Then identify:
+1. Unclear acceptance criteria
+2. Missing technical constraints
+3. Undefined edge cases
+4. Implementation approach decisions needed
+
+For each ambiguity found, ask a clarifying question using the AskUserQuestion tool.
+
+After getting answers, update the issue with clarifications as a comment using:
+gh issue comment $issue --body "## Clarifications from Interview\\n\\n[add clarifications here]"
+
+Focus on making this issue implementable without guesswork.
+EOF
+)
+
+    $claude_cmd --print "$prompt"
+
+    log_success "Interview complete for issue #$issue"
+}
+
+# ============================================================================
+# PLAN COMMAND
+# ============================================================================
+cmd_plan() {
+    local issue="${1:-}"
+    local max_iter="${2:-0}"
+
+    if [[ -z "$issue" ]]; then
+        log_error "Missing required argument: <issue>"
+        echo "Usage: barf plan <issue> [max_iterations]"
+        exit 1
+    fi
+
+    print_header "Planning Mode - Issue #$issue"
+
+    local plan_file="$PLANS_DIR/issue-$issue-plan.md"
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log_dry_run "Would generate implementation plan for issue #$issue"
+        log_dry_run "Plan would be saved to: $plan_file"
+        [[ $max_iter -gt 0 ]] && log_dry_run "Max iterations: $max_iter"
+        [[ $PARALLEL -eq 1 ]] && log_dry_run "Would process sub-issues in parallel"
+
+        log_dry_run "Would prompt Claude with:"
+        cat << EOF
+
+${CYAN}--- Claude Prompt ---${NC}
+Generate a detailed implementation plan for issue #$issue.
+
+Steps:
+1. Fetch issue requirements from GitHub
+2. Study existing codebase with parallel subagents
+3. Create detailed, step-by-step plan including:
+   - Task breakdown with checkboxes
+   - File references (with line numbers)
+   - Strict requirements from issue
+   - Validation approach for each task
+   - Risk assessment
+
+Handle context limits by:
+- Saving partial plan
+- Documenting what's missing
+- Recommending sub-issue splits
+
+Output: Save plan to $plan_file
+${CYAN}--- End Prompt ---${NC}
+
+EOF
+
+        if [[ $PARALLEL -eq 1 ]]; then
+            cat << EOF
+${CYAN}--- Parallel Processing ---${NC}
+If sub-issues are recommended, they would be processed in parallel:
+- Each sub-issue gets its own planning agent
+- Plans are generated concurrently
+- Results are aggregated into parent plan
+${CYAN}--- End Parallel Processing ---${NC}
+
+EOF
+        fi
+
+        return 0
+    fi
+
+    check_dependencies
+    ensure_dirs
+
+    local claude_cmd
+    claude_cmd=$(build_claude_cmd)
+
+    log_info "Generating implementation plan for issue #$issue..."
+    [[ $max_iter -gt 0 ]] && log_info "Max iterations: $max_iter"
+    [[ $PARALLEL -eq 1 ]] && log_info "Parallel sub-issue processing enabled"
+    log_verbose "Plan will be saved to: $plan_file"
+    log_verbose "Using command: $claude_cmd"
+
+    local iter_flag=""
+    [[ $max_iter -gt 0 ]] && iter_flag="Limit to $max_iter iterations maximum."
+
+    local parallel_instructions=""
+    if [[ $PARALLEL -eq 1 ]]; then
+        parallel_instructions="
+PARALLEL PROCESSING:
+If you detect this issue needs to be split into sub-issues:
+1. Identify all sub-issues needed
+2. For each sub-issue, spawn a parallel subagent to generate its plan
+3. Run all planning subagents concurrently using Task tool
+4. Aggregate all sub-plans into the main plan file
+5. Track parent-child relationships with labels
+"
+    fi
+
+    local prompt
+    prompt=$(cat << EOF
+Generate a detailed implementation plan for GitHub issue #$issue.
+
+First, fetch the issue: gh issue view $issue --json number,title,body,comments,labels
+
+Study the existing codebase to understand:
+- Project structure and patterns
+- Related existing code
+- Test patterns in use
+- Build/lint configurations
+
+Create a detailed plan with this structure:
+
+# Implementation Plan for Issue #$issue
+
+## Issue Summary
+[Brief summary of what needs to be done]
+
+## Acceptance Criteria
+[List from issue]
+
+## Implementation Tasks
+
+### Task 1: [Task name]
+**Requirements:**
+- [Link to specific issue requirement]
+
+**Implementation:**
+1. [Step by step]
+
+**Files affected:**
+- [file paths]
+
+**Validation:**
+- [How to verify this task]
+
+**Risks:**
+- [Potential issues]
+
+### Task 2: ...
+[Continue for all tasks]
+
+## Completion Checklist
+- [ ] Task 1
+- [ ] Task 2
+...
+
+$iter_flag
+$parallel_instructions
+
+Save the plan to: $plan_file
+
+If context limits are reached:
+1. Save what you have
+2. Add a "## Needs Further Planning" section
+3. List recommended sub-issue splits
+EOF
+)
+
+    $claude_cmd --print "$prompt"
+
+    if [[ -f "$plan_file" ]]; then
+        log_success "Plan generated: $plan_file"
+    else
+        log_warning "Plan file not found at expected location: $plan_file"
+    fi
+}
+
+# ============================================================================
+# BUILD COMMAND
+# ============================================================================
+cmd_build() {
+    local issue="${1:-}"
+    local max_iter="${2:-0}"
+
+    if [[ -z "$issue" ]]; then
+        log_error "Missing required argument: <issue>"
+        echo "Usage: barf build <issue> [max_iterations]"
+        exit 1
+    fi
+
+    print_header "Building Mode - Issue #$issue"
+
+    local plan_file="$PLANS_DIR/issue-$issue-plan.md"
+    local progress_file="$PLANS_DIR/issue-$issue-progress.md"
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log_dry_run "Would implement issue #$issue from plan"
+        log_dry_run "Plan file: $plan_file"
+        log_dry_run "Progress file: $progress_file"
+        [[ $max_iter -gt 0 ]] && log_dry_run "Max iterations: $max_iter"
+
+        # Check if plan exists and show next task
+        if [[ -f "$plan_file" ]]; then
+            log_dry_run "Plan file exists. Analyzing next task..."
+            echo ""
+            echo -e "${CYAN}--- Next Task Preview ---${NC}"
+
+            # Find first unchecked task
+            local next_task
+            next_task=$(grep -n "^\- \[ \]" "$plan_file" | head -1 || echo "")
+
+            if [[ -n "$next_task" ]]; then
+                echo "Next incomplete task found:"
+                echo "$next_task"
+            else
+                # Check for checkbox format [  ]
+                next_task=$(grep -n "^\[[ ]\]" "$plan_file" | head -1 || echo "")
+                if [[ -n "$next_task" ]]; then
+                    echo "Next incomplete task found:"
+                    echo "$next_task"
+                else
+                    echo "No incomplete tasks found - plan may be complete!"
+                fi
+            fi
+            echo -e "${CYAN}--- End Preview ---${NC}"
+        else
+            log_dry_run "No plan file found at: $plan_file"
+            log_dry_run "Would need to run: barf plan $issue first"
+        fi
+
+        cat << EOF
+
+${CYAN}--- Claude Would Be Prompted With ---${NC}
+Implement issue #$issue following the plan at $plan_file.
+
+Each iteration:
+1. Read the plan and find the most important incomplete task
+2. Search codebase - never assume file contents
+3. Implement the task
+4. Run tests (provides backpressure)
+5. Commit on success
+6. Update plan (check off completed task)
+
+If stuck:
+- Create progress notes at $progress_file
+- Document what was tried
+- Retry with fresh context
+
+If context limits reached:
+- Save progress notes
+- Exit for human intervention
+${CYAN}--- End Prompt ---${NC}
+
+EOF
+        return 0
+    fi
+
+    check_dependencies
+    ensure_dirs
+
+    if [[ ! -f "$plan_file" ]]; then
+        log_error "Plan file not found: $plan_file"
+        echo "Run 'barf plan $issue' first to generate a plan."
+        exit 1
+    fi
+
+    local claude_cmd
+    claude_cmd=$(build_claude_cmd)
+
+    log_info "Implementing issue #$issue from plan..."
+    [[ $max_iter -gt 0 ]] && log_info "Max iterations: $max_iter"
+    log_verbose "Reading plan from: $plan_file"
+    log_verbose "Using command: $claude_cmd"
+
+    local iter_flag=""
+    [[ $max_iter -gt 0 ]] && iter_flag="Limit to $max_iter iterations maximum."
+
+    local prompt
+    prompt=$(cat << EOF
+Implement GitHub issue #$issue by following the plan at $plan_file.
+
+ITERATION LOOP:
+Each iteration:
+1. Read $plan_file and identify the most important incomplete task (marked [ ])
+2. Search the codebase for relevant files - NEVER assume content
+3. Implement the task following the plan's specifications
+4. Run tests: look for test commands in package.json, Makefile, or common patterns
+5. If tests pass, commit with message: "feat(#$issue): [task description]"
+6. Update $plan_file - change [ ] to [x] for completed task
+7. If more tasks remain and iterations available, continue
+
+HANDLING BEING STUCK:
+If stuck on a task after reasonable attempts:
+1. Create $progress_file with:
+   - Current state (what's done)
+   - Current task
+   - How we got here (step by step)
+   - The problem encountered
+   - What was tried
+   - Recommendations
+2. Try a different approach with fresh context
+3. After 3 stuck attempts on same task, exit for human help
+
+HANDLING CONTEXT LIMITS:
+If approaching context limits:
+1. Save progress notes
+2. Document recommended issue splits
+3. Exit gracefully
+
+$iter_flag
+EOF
+)
+
+    $claude_cmd --print "$prompt"
+
+    log_success "Build session complete for issue #$issue"
+
+    # Show summary
+    if [[ -f "$plan_file" ]]; then
+        local done
+        local total
+        done=$(grep -c "^\[x\]" "$plan_file" 2>/dev/null || echo "0")
+        total=$(grep -c "^\[.\]" "$plan_file" 2>/dev/null || echo "0")
+        log_info "Progress: $done/$total tasks complete"
+    fi
+}
+
+# ============================================================================
+# AUDIT COMMAND
+# ============================================================================
+cmd_audit() {
+    print_header "Audit Mode"
+
+    local audit_file="AUDIT_REPORT.md"
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log_dry_run "Would perform comprehensive code quality analysis"
+        log_dry_run "Report would be saved to: $audit_file"
+
+        cat << EOF
+
+${CYAN}--- Claude Would Be Prompted With ---${NC}
+Perform a comprehensive audit of this codebase.
+
+Analysis areas:
+1. Code quality - patterns, consistency, potential bugs
+2. Test coverage - what's tested, what's missing
+3. Security - common vulnerabilities (OWASP top 10)
+4. Technical debt - areas needing refactoring
+5. Documentation - completeness and accuracy
+6. Dependencies - outdated, vulnerable packages
+
+For each finding:
+- Severity: Critical/High/Medium/Low
+- Location: file and line number
+- Description: what the issue is
+- Recommendation: how to fix
+
+Output: Save findings to $audit_file
+${CYAN}--- End Prompt ---${NC}
+
+EOF
+        return 0
+    fi
+
+    check_dependencies
+
+    local claude_cmd
+    claude_cmd=$(build_claude_cmd)
+
+    log_info "Running comprehensive code audit..."
+    log_verbose "Report will be saved to: $audit_file"
+
+    local prompt
+    prompt=$(cat << EOF
+Perform a comprehensive audit of this codebase.
+
+Analyze:
+1. **Code Quality**
+   - Design patterns and consistency
+   - Potential bugs and edge cases
+   - Error handling completeness
+
+2. **Test Coverage**
+   - What's well tested
+   - Coverage gaps
+   - Test quality assessment
+
+3. **Security**
+   - OWASP Top 10 vulnerabilities
+   - Sensitive data handling
+   - Authentication/authorization
+
+4. **Technical Debt**
+   - Areas needing refactoring
+   - Outdated patterns
+   - Complexity hotspots
+
+5. **Documentation**
+   - Missing/outdated docs
+   - API documentation
+   - Code comments quality
+
+6. **Dependencies**
+   - Outdated packages
+   - Known vulnerabilities
+   - Unused dependencies
+
+Create a report at $audit_file with:
+- Executive summary
+- Findings by category (with severity ratings)
+- Prioritized recommendations
+- Quick wins vs long-term improvements
+
+Severity levels: Critical, High, Medium, Low, Info
+EOF
+)
+
+    $claude_cmd --print "$prompt"
+
+    if [[ -f "$audit_file" ]]; then
+        log_success "Audit complete: $audit_file"
+    else
+        log_warning "Audit report not found at expected location"
+    fi
+}
+
+# ============================================================================
+# NEW COMMAND - Issue Templates
+# ============================================================================
+cmd_new() {
+    local template_type="${1:-}"
+    local title="${2:-}"
+
+    if [[ -z "$template_type" ]] || [[ -z "$title" ]]; then
+        log_error "Missing required arguments"
+        echo "Usage: barf new <type> <title>"
+        echo ""
+        echo "Available templates:"
+        echo "  feature   - New feature request"
+        echo "  bug       - Bug report"
+        echo "  refactor  - Code refactoring"
+        echo "  docs      - Documentation update"
+        echo "  test      - Add/improve tests"
+        echo "  chore     - Maintenance task"
+        exit 1
+    fi
+
+    print_header "Creating New Issue: $template_type"
+
+    # Convert title to filename (lowercase, replace spaces with dashes)
+    local filename
+    filename=$(echo "$title" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-')
+    local issue_file="$ISSUES_DIR/$filename.md"
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log_dry_run "Would create issue file: $issue_file"
+        log_dry_run "Template type: $template_type"
+        log_dry_run "Title: $title"
+        echo ""
+        echo -e "${CYAN}--- Template Preview ---${NC}"
+        generate_template "$template_type" "$title"
+        echo -e "${CYAN}--- End Preview ---${NC}"
+        return 0
+    fi
+
+    ensure_dirs
+
+    if [[ -f "$issue_file" ]]; then
+        log_error "Issue file already exists: $issue_file"
+        exit 1
+    fi
+
+    log_info "Creating issue from '$template_type' template..."
+    log_verbose "File: $issue_file"
+
+    generate_template "$template_type" "$title" > "$issue_file"
+
+    log_success "Created: $issue_file"
+    log_info "Edit the file and then create the GitHub issue with:"
+    echo "  gh issue create --title \"$title\" --body-file \"$issue_file\""
+}
+
+generate_template() {
+    local type="$1"
+    local title="$2"
+
+    case "$type" in
+        feature)
+            cat << EOF
+# $title
+
+## Summary
+[Brief description of the feature]
+
+## Motivation
+[Why is this feature needed? What problem does it solve?]
+
+## Detailed Description
+[Detailed explanation of the feature]
+
+## Acceptance Criteria
+- [ ] [Criterion 1]
+- [ ] [Criterion 2]
+- [ ] [Criterion 3]
+
+## Technical Considerations
+- **Affected areas:** [List components/files likely to change]
+- **Dependencies:** [External dependencies or related issues]
+- **Performance:** [Any performance considerations]
+
+## Design Notes
+[Optional: API design, UI mockups, architecture decisions]
+
+## Out of Scope
+[What this feature explicitly does NOT include]
+
+## Testing Requirements
+- [ ] Unit tests for [component]
+- [ ] Integration tests for [flow]
+- [ ] Manual testing for [scenario]
+EOF
+            ;;
+        bug)
+            cat << EOF
+# Bug: $title
+
+## Summary
+[One-line description of the bug]
+
+## Environment
+- **OS:** [e.g., macOS 14.0, Ubuntu 22.04]
+- **Version:** [e.g., v1.2.3, commit hash]
+- **Browser:** [if applicable]
+
+## Steps to Reproduce
+1. [Step 1]
+2. [Step 2]
+3. [Step 3]
+
+## Expected Behavior
+[What should happen]
+
+## Actual Behavior
+[What actually happens]
+
+## Error Messages
+\`\`\`
+[Paste any error messages or stack traces]
+\`\`\`
+
+## Screenshots
+[If applicable]
+
+## Additional Context
+[Any other relevant information]
+
+## Acceptance Criteria
+- [ ] Bug no longer reproducible
+- [ ] Regression test added
+- [ ] No new issues introduced
+EOF
+            ;;
+        refactor)
+            cat << EOF
+# Refactor: $title
+
+## Summary
+[Brief description of what needs refactoring]
+
+## Current State
+[Describe the current implementation and its problems]
+
+## Proposed Changes
+[Describe the refactoring approach]
+
+## Motivation
+- [ ] Improve maintainability
+- [ ] Improve performance
+- [ ] Reduce complexity
+- [ ] Enable future features
+- [ ] Fix technical debt
+
+## Affected Areas
+- [File/component 1]
+- [File/component 2]
+
+## Acceptance Criteria
+- [ ] All existing tests pass
+- [ ] No functionality changes (unless specified)
+- [ ] Code review approved
+- [ ] Documentation updated if needed
+
+## Risks
+[Potential risks and mitigation strategies]
+
+## Testing Plan
+- [ ] Existing tests cover changes
+- [ ] Manual regression testing for [areas]
+EOF
+            ;;
+        docs)
+            cat << EOF
+# Documentation: $title
+
+## Summary
+[What documentation needs to be added/updated]
+
+## Type
+- [ ] New documentation
+- [ ] Update existing docs
+- [ ] Fix inaccuracies
+- [ ] Improve clarity
+
+## Scope
+[Which docs/sections are affected]
+
+## Content Outline
+1. [Section 1]
+2. [Section 2]
+3. [Section 3]
+
+## Acceptance Criteria
+- [ ] Documentation is accurate
+- [ ] Examples are working
+- [ ] Links are valid
+- [ ] Follows style guide
+EOF
+            ;;
+        test)
+            cat << EOF
+# Testing: $title
+
+## Summary
+[What tests need to be added/improved]
+
+## Type
+- [ ] Unit tests
+- [ ] Integration tests
+- [ ] End-to-end tests
+- [ ] Performance tests
+
+## Coverage Target
+[Specific areas/functions that need test coverage]
+
+## Test Cases
+- [ ] [Test case 1]
+- [ ] [Test case 2]
+- [ ] [Test case 3]
+
+## Acceptance Criteria
+- [ ] Test coverage increased to [X]%
+- [ ] All new tests pass
+- [ ] Tests are maintainable and clear
+- [ ] Edge cases covered
+EOF
+            ;;
+        chore)
+            cat << EOF
+# Chore: $title
+
+## Summary
+[Brief description of the maintenance task]
+
+## Type
+- [ ] Dependency update
+- [ ] CI/CD improvement
+- [ ] Build optimization
+- [ ] Cleanup
+- [ ] Configuration
+
+## Tasks
+- [ ] [Task 1]
+- [ ] [Task 2]
+- [ ] [Task 3]
+
+## Acceptance Criteria
+- [ ] [Criterion 1]
+- [ ] [Criterion 2]
+- [ ] Build/tests still pass
+EOF
+            ;;
+        *)
+            log_error "Unknown template type: $type"
+            echo "Available types: feature, bug, refactor, docs, test, chore"
+            exit 1
+            ;;
+    esac
+}
+
+# ============================================================================
+# DASHBOARD COMMAND
+# ============================================================================
+cmd_dashboard() {
+    print_header "BARF Dashboard"
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log_dry_run "Would display project dashboard with:"
+        log_dry_run "  - All issues and their status"
+        log_dry_run "  - Build progress for each issue"
+        log_dry_run "  - Recent activity"
+        return 0
+    fi
+
+    # Check if gh is available
+    if ! command -v gh &> /dev/null; then
+        log_warning "GitHub CLI (gh) not available - showing local data only"
+    fi
+
+    echo ""
+
+    # Section 1: Issues Overview (from GitHub)
+    echo -e "${BOLD}Issues Overview${NC}"
+    echo -e "${DIM}─────────────────────────────────────────────────${NC}"
+
+    if command -v gh &> /dev/null; then
+        # Fetch open issues
+        local issues
+        issues=$(gh issue list --limit 20 --json number,title,state,labels 2>/dev/null || echo "[]")
+
+        if [[ "$issues" == "[]" ]] || [[ -z "$issues" ]]; then
+            echo "  No open issues found"
+        else
+            echo "$issues" | while IFS= read -r line; do
+                # Parse JSON (simple approach for bash)
+                if command -v jq &> /dev/null; then
+                    echo "$issues" | jq -r '.[] | "  #\(.number) [\(.state)] \(.title)"' 2>/dev/null || echo "  (install jq for better formatting)"
+                    break
+                else
+                    echo "  (install jq for formatted issue list)"
+                    echo "  Run: gh issue list"
+                    break
+                fi
+            done
+        fi
+    else
+        echo "  (gh CLI not available)"
+    fi
+
+    echo ""
+
+    # Section 2: Plans Status
+    echo -e "${BOLD}Plan Status${NC}"
+    echo -e "${DIM}─────────────────────────────────────────────────${NC}"
+
+    if [[ -d "$PLANS_DIR" ]]; then
+        local plan_count=0
+        for plan_file in "$PLANS_DIR"/issue-*-plan.md; do
+            [[ -f "$plan_file" ]] || continue
+            plan_count=$((plan_count + 1))
+
+            local issue_num
+            issue_num=$(basename "$plan_file" | sed 's/issue-\(.*\)-plan.md/\1/')
+
+            # Count tasks
+            local done=0
+            local pending=0
+            local total=0
+
+            if [[ -f "$plan_file" ]]; then
+                done=$(grep -c "^\[x\]" "$plan_file" 2>/dev/null || echo "0")
+                pending=$(grep -c "^\[ \]" "$plan_file" 2>/dev/null || echo "0")
+                total=$((done + pending))
+            fi
+
+            # Progress bar
+            local pct=0
+            [[ $total -gt 0 ]] && pct=$((done * 100 / total))
+            local bar_done=$((pct / 5))
+            local bar_pending=$((20 - bar_done))
+            local bar=""
+            for ((i=0; i<bar_done; i++)); do bar+="█"; done
+            for ((i=0; i<bar_pending; i++)); do bar+="░"; done
+
+            # Status indicator
+            local status_icon="○"
+            local status_color="$YELLOW"
+            if [[ $done -eq $total ]] && [[ $total -gt 0 ]]; then
+                status_icon="●"
+                status_color="$GREEN"
+            elif [[ -f "$PLANS_DIR/issue-$issue_num-progress.md" ]]; then
+                status_icon="◐"
+                status_color="$YELLOW"
+            fi
+
+            printf "  ${status_color}%s${NC} Issue #%-4s [%s] %3d%% (%d/%d tasks)\n" \
+                "$status_icon" "$issue_num" "$bar" "$pct" "$done" "$total"
+        done
+
+        if [[ $plan_count -eq 0 ]]; then
+            echo "  No plans found in $PLANS_DIR/"
+            echo "  Run: barf plan <issue> to create one"
+        fi
+    else
+        echo "  No plans directory found"
+    fi
+
+    echo ""
+
+    # Section 3: Progress Notes (stuck issues)
+    echo -e "${BOLD}Progress Notes (Stuck Issues)${NC}"
+    echo -e "${DIM}─────────────────────────────────────────────────${NC}"
+
+    local progress_count=0
+    if [[ -d "$PLANS_DIR" ]]; then
+        for progress_file in "$PLANS_DIR"/issue-*-progress.md; do
+            [[ -f "$progress_file" ]] || continue
+            progress_count=$((progress_count + 1))
+
+            local issue_num
+            issue_num=$(basename "$progress_file" | sed 's/issue-\(.*\)-progress.md/\1/')
+
+            local last_modified
+            last_modified=$(stat -c %Y "$progress_file" 2>/dev/null || stat -f %m "$progress_file" 2>/dev/null || echo "0")
+            local now
+            now=$(date +%s)
+            local age_hours=$(( (now - last_modified) / 3600 ))
+
+            printf "  ${YELLOW}⚠${NC} Issue #%-4s (updated %dh ago) → %s\n" \
+                "$issue_num" "$age_hours" "$progress_file"
+        done
+    fi
+
+    if [[ $progress_count -eq 0 ]]; then
+        echo "  No stuck issues - all clear!"
+    fi
+
+    echo ""
+
+    # Section 4: Local Issues (from issues/ directory)
+    echo -e "${BOLD}Local Issue Files${NC}"
+    echo -e "${DIM}─────────────────────────────────────────────────${NC}"
+
+    if [[ -d "$ISSUES_DIR" ]]; then
+        local issue_file_count=0
+        for issue_file in "$ISSUES_DIR"/*.md; do
+            [[ -f "$issue_file" ]] || continue
+            issue_file_count=$((issue_file_count + 1))
+
+            local filename
+            filename=$(basename "$issue_file")
+            local title
+            title=$(head -1 "$issue_file" | sed 's/^#\s*//')
+
+            printf "  📄 %-30s %s\n" "$filename" "$title"
+        done
+
+        if [[ $issue_file_count -eq 0 ]]; then
+            echo "  No local issue files"
+            echo "  Create one: barf new feature \"My Feature\""
+        fi
+    else
+        echo "  No issues directory"
+    fi
+
+    echo ""
+
+    # Section 5: Recent Git Activity
+    echo -e "${BOLD}Recent Activity${NC}"
+    echo -e "${DIM}─────────────────────────────────────────────────${NC}"
+
+    if git rev-parse --git-dir > /dev/null 2>&1; then
+        # Show last 5 commits
+        git log --oneline -5 --pretty=format:"  %C(yellow)%h%C(reset) %s %C(dim)(%cr)%C(reset)" 2>/dev/null || echo "  No commits yet"
+        echo ""
+    else
+        echo "  Not a git repository"
+    fi
+
+    echo ""
+
+    # Section 6: Quick Stats
+    echo -e "${BOLD}Quick Stats${NC}"
+    echo -e "${DIM}─────────────────────────────────────────────────${NC}"
+
+    local total_plans=0
+    local completed_plans=0
+    local total_tasks=0
+    local completed_tasks=0
+
+    if [[ -d "$PLANS_DIR" ]]; then
+        for plan_file in "$PLANS_DIR"/issue-*-plan.md; do
+            [[ -f "$plan_file" ]] || continue
+            total_plans=$((total_plans + 1))
+
+            local done
+            local pending
+            done=$(grep -c "^\[x\]" "$plan_file" 2>/dev/null || echo "0")
+            pending=$(grep -c "^\[ \]" "$plan_file" 2>/dev/null || echo "0")
+
+            completed_tasks=$((completed_tasks + done))
+            total_tasks=$((total_tasks + done + pending))
+
+            [[ $pending -eq 0 ]] && [[ $done -gt 0 ]] && completed_plans=$((completed_plans + 1))
+        done
+    fi
+
+    echo "  Plans:  $completed_plans/$total_plans completed"
+    echo "  Tasks:  $completed_tasks/$total_tasks completed"
+
+    if [[ $progress_count -gt 0 ]]; then
+        echo -e "  ${YELLOW}Stuck:   $progress_count issue(s) need attention${NC}"
+    fi
+
+    echo ""
+}
+
+# ============================================================================
+# MAIN - Argument Parsing
+# ============================================================================
+main() {
+    local command=""
+    local args=()
+
+    # Parse global options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            --version)
+                show_version
+                exit 0
+                ;;
+            -m|--model)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "--model requires an argument"
+                    exit 1
+                fi
+                MODEL="$2"
+                shift 2
+                ;;
+            -n|--dry-run)
+                DRY_RUN=1
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=$((VERBOSE + 1))
+                shift
+                ;;
+            -vv)
+                VERBOSE=2
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=1
+                # Disable colors in quiet mode
+                RED='' GREEN='' YELLOW='' BLUE='' MAGENTA='' CYAN='' BOLD='' DIM='' NC=''
+                shift
+                ;;
+            -p|--parallel)
+                PARALLEL=1
+                shift
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                echo "Use 'barf --help' for usage information"
+                exit 1
+                ;;
+            *)
+                # First non-option is the command
+                if [[ -z "$command" ]]; then
+                    command="$1"
+                else
+                    args+=("$1")
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Handle empty command
+    if [[ -z "$command" ]]; then
+        show_usage
+        exit 0
+    fi
+
+    # Debug output
+    log_debug "Command: $command"
+    log_debug "Args: ${args[*]:-}"
+    log_debug "DRY_RUN=$DRY_RUN VERBOSE=$VERBOSE QUIET=$QUIET PARALLEL=$PARALLEL MODEL=$MODEL"
+
+    # Route to command handlers
+    case "$command" in
+        interview)
+            cmd_interview "${args[@]:-}"
+            ;;
+        plan)
+            cmd_plan "${args[@]:-}"
+            ;;
+        build)
+            cmd_build "${args[@]:-}"
+            ;;
+        audit)
+            cmd_audit "${args[@]:-}"
+            ;;
+        new)
+            cmd_new "${args[@]:-}"
+            ;;
+        dashboard)
+            cmd_dashboard
+            ;;
+        help)
+            show_usage
+            ;;
+        *)
+            log_error "Unknown command: $command"
+            echo "Use 'barf --help' for available commands"
+            exit 1
+            ;;
+    esac
+}
+
+# Run main with all arguments
+main "$@"
