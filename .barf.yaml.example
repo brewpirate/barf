@@ -1,0 +1,76 @@
+# BARF Configuration Example
+# Copy this to .barf.yaml and customize for your project
+
+# Default model for all operations
+# Options: claude-opus-4-5-20250514, claude-sonnet-4-20250514, claude-haiku-4-20250514
+# Shortcuts in CLI: opus, sonnet, haiku
+model: claude-opus-4-5-20250514
+
+# Git automation settings
+git:
+  # Automatically create and switch to issue-specific branches
+  auto_branch: true
+
+  # Branch naming format
+  # Available placeholders:
+  #   {issue} - Full issue identifier (e.g., "42" or "auth")
+  #   {issue_number} - Numeric portion only
+  # Examples:
+  #   "feat/{issue}" -> feat/42
+  #   "feature/issue-{issue_number}" -> feature/issue-42
+  #   "dev/{issue}" -> dev/auth
+  branch_format: "feat/{issue}"
+
+  # Base branch to create new branches from
+  # If empty, branches from current HEAD
+  base_branch: main
+
+# Cost tracking settings
+tracking:
+  # Enable/disable cost tracking
+  enabled: true
+
+  # Warn when an issue's cost exceeds this threshold (in USD)
+  warn_threshold: 5.00
+
+  # Show cost summary after each operation
+  show_summary: true
+
+# Plan generation settings
+plans:
+  # Automatically backup plans before regenerating
+  auto_backup: true
+
+  # Show diff when regenerating plans (same as --diff flag)
+  diff_on_regenerate: true
+
+  # Maximum tasks per plan (recommends split if exceeded)
+  max_tasks: 15
+
+# Interview mode settings
+interview:
+  # Automatically post clarifying questions as issue comments
+  auto_comment: true
+
+  # Label to add when interview is complete
+  clarified_label: "clarified"
+
+# Build mode settings
+build:
+  # Maximum retries when stuck on same task
+  max_stuck_retries: 3
+
+  # Automatically run tests after each task
+  auto_test: true
+
+  # Commit message format
+  # Placeholders: {issue}, {task}
+  commit_format: "feat(#{issue}): {task}"
+
+# Audit mode settings
+audit:
+  # Include test coverage analysis
+  include_coverage: true
+
+  # Output file for audit report
+  output_file: "AUDIT_REPORT.md"

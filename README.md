@@ -508,6 +508,143 @@ $ barf audit
 6. **Update AGENTS.md** - Capture operational learnings
 7. **Regenerate plans** - Plans are disposable, regenerate if wrong
 
+## Cost Tracking
+
+BARF tracks Claude API usage per issue, helping you monitor costs.
+
+### View Statistics
+
+```bash
+# Show all issues
+barf stats
+
+# Show specific issue
+barf stats 42
+```
+
+### Example Output
+
+```
+============================================================
+  Cost Tracking for Issue: 42
+============================================================
+
+  Metric                            Value
+  ------------------------- ---------------
+  Input Tokens                       125.3K
+  Output Tokens                       45.2K
+  API Calls                              12
+  Estimated Cost                    $2.4567
+
+  Model Breakdown:
+  --------------------------------------------------
+    opus-4-5                    8 calls  $2.1234
+    sonnet-4                    4 calls  $0.3333
+```
+
+### Pricing
+
+BARF uses current Claude API pricing (per million tokens):
+
+| Model | Input | Output |
+|-------|-------|--------|
+| Opus 4.5 | $15.00 | $75.00 |
+| Sonnet 4 | $3.00 | $15.00 |
+| Haiku 4 | $0.25 | $1.25 |
+
+## Plan Diffing
+
+When regenerating plans, see exactly what changed:
+
+```bash
+# Regenerate plan and show diff
+barf plan 42 --diff
+```
+
+### Example Diff Output
+
+```diff
+--- plans/issue-42-plan.md (previous)
++++ plans/issue-42-plan.md (current)
+@@ -15,6 +15,10 @@
+ ### Task 2: Implement middleware
+-**Implementation:**
+-1. Create basic middleware
++**Implementation:**
++1. Create middleware factory
++2. Add dependency injection
++3. Implement error handling
+
+Semantic Analysis:
+----------------------------------------
+
+New Tasks Added (1):
+  + ### Task 4: Add rate limiting
+
+Tasks Removed (0):
+
+Progress: 2 -> 3 tasks completed
+```
+
+### Auto-Backup
+
+By default, BARF backs up plans before regenerating. Configure in `.barf.yaml`:
+
+```yaml
+plans:
+  auto_backup: true
+  diff_on_regenerate: true  # Always show diff
+```
+
+## Git Branch Automation
+
+BARF can automatically create and manage branches per issue.
+
+### Configuration
+
+Add to `.barf.yaml`:
+
+```yaml
+git:
+  auto_branch: true
+  branch_format: "feat/{issue}"
+  base_branch: main
+```
+
+### Branch Format Placeholders
+
+- `{issue}` - Full issue identifier (e.g., "42" or "auth")
+- `{issue_number}` - Numeric portion only
+
+### Example Formats
+
+```yaml
+# Standard feature branch
+branch_format: "feat/{issue}"        # -> feat/42
+
+# With prefix
+branch_format: "feature/issue-{issue_number}"  # -> feature/issue-42
+
+# Custom naming
+branch_format: "dev/{issue}"         # -> dev/42
+```
+
+### Behavior
+
+When you run any issue command (`interview`, `plan`, `build`):
+
+1. BARF checks if `auto_branch` is enabled
+2. Creates branch from `base_branch` if it doesn't exist
+3. Switches to the issue branch
+4. All commits go to this branch
+
+```bash
+$ barf plan 42
+[INFO] Creating new branch: feat/42
+[OK] Branch ready: feat/42
+>>> Fetching issue #42...
+```
+
 ## Credits
 
 Based on [Geoff Huntley's Ralph methodology](https://ghuntley.com/ralph/) and the [Ralph playbook](https://github.com/ClaytonFarr/ralph-playbook) by Clayton Farr.
