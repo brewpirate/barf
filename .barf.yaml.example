@@ -1,0 +1,117 @@
+# BARF Configuration
+# Copy this to .barf.yaml in your project root
+
+# ============================================================================
+# Issue Source Plugin
+# ============================================================================
+source:
+  # Plugin type: local | github | gitlab | custom
+  type: local
+
+  # For local plugin: directory containing issue markdown files
+  path: ./issues
+
+  # For github/gitlab plugins: repository identifier
+  # repo: owner/repo
+
+  # For custom plugins: path to plugin script
+  # plugin: ./plugins/custom.sh
+
+# ============================================================================
+# Issue Referencing
+# ============================================================================
+issues:
+  # How issues are referenced in commands
+  # filename: barf plan my-feature (references issues/my-feature.md)
+  # number: barf plan 42 (references issues/42.md or GitHub issue #42)
+  reference: filename
+
+# ============================================================================
+# Plugin Commands
+# ============================================================================
+# These define the interface between BARF and issue source plugins.
+# Customize if your plugin uses different command names.
+commands:
+  fetch: /fetch       # Get issue content
+  update: /update     # Update issue content
+  comment: /comment   # Add comment to issue
+  context: /context   # Get full context (issue + comments)
+  status: /status     # Get or set issue status
+  list: /list         # List all issues
+  create: /create     # Create new issue
+  link: /link         # Link sub-issue to parent
+
+# ============================================================================
+# Output Paths
+# ============================================================================
+plans:
+  # Directory for generated plans and progress notes
+  path: ./plans
+
+# ============================================================================
+# Auto-Split Settings
+# ============================================================================
+split:
+  # Enable automatic issue splitting when context fills up
+  enabled: true
+
+  # Maximum retry attempts before forcing a split
+  max_retries: 3
+
+  # Naming pattern for sub-issues
+  # {issue} = original issue name, {n} = part number
+  pattern: "{issue}-part{n}"
+
+# ============================================================================
+# Model Selection (Auto)
+# ============================================================================
+# BARF automatically selects the best model per task.
+# Override only if needed.
+models:
+  # Quick lookups, simple analysis
+  fast: haiku
+
+  # Planning, code generation
+  default: sonnet
+
+  # Complex reasoning, architecture decisions
+  complex: opus
+
+# ============================================================================
+# Build Settings
+# ============================================================================
+build:
+  # Commit message format
+  # {issue} = issue name, {task} = task description
+  commit_format: "feat({issue}): {task}"
+
+  # Run tests after each task (backpressure)
+  run_tests: true
+
+  # Test command (auto-detected from AGENTS.md if not specified)
+  # test_command: npm test
+
+# ============================================================================
+# Interview Settings
+# ============================================================================
+interview:
+  # Automatically update issue with clarifications
+  auto_update: true
+
+  # Add clarifications as comments (true) or edit issue body (false)
+  use_comments: true
+
+# ============================================================================
+# Audit Settings
+# ============================================================================
+audit:
+  # Output file for audit report
+  output: ./AUDIT_REPORT.md
+
+  # Checks to run
+  checks:
+    - code_quality
+    - issue_compliance
+    - test_coverage
+    - technical_debt
+    - consistency
