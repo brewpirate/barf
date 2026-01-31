@@ -7,11 +7,17 @@ set -euo pipefail
 # ============================================================================
 # Constants
 # ============================================================================
-VERSION="0.1.0"
+VERSION="0.2.0"
 CONFIG_FILE=".barf.yaml"
 DEFAULT_ISSUES_DIR="./issues"
 DEFAULT_PLANS_DIR="./plans"
 DEFAULT_MAX_RETRIES=3
+
+# Approximate token limits per model (conservative estimates)
+TOKEN_LIMIT_HAIKU=180000
+TOKEN_LIMIT_SONNET=180000
+TOKEN_LIMIT_OPUS=180000
+CHARS_PER_TOKEN=4  # Rough estimate
 
 # Colors for output
 RED='\033[0;31m'
@@ -48,6 +54,170 @@ die() {
 # Check if a command exists
 require_cmd() {
     command -v "$1" &> /dev/null || die "Required command not found: $1"
+}
+
+# ============================================================================
+# Test Command Auto-Detection
+# ============================================================================
+
+# Detect the test command for the current project
+detect_test_command() {
+    # Check AGENTS.md first (user preference)
+    if [[ -f "AGENTS.md" ]]; then
+        local agents_test
+        agents_test=$(grep -A1 "# Run tests" "AGENTS.md" 2>/dev/null | tail -1 | sed 's/^#[[:space:]]*//' | tr -d '\n')
+        if [[ -n "$agents_test" && "$agents_test" != "#"* ]]; then
+            echo "$agents_test"
+            return
+        fi
+    fi
+
+    # Check package.json (Node.js)
+    if [[ -f "package.json" ]]; then
+        if grep -q '"test"' "package.json"; then
+            echo "npm test"
+            return
+        fi
+    fi
+
+    # Check for pytest (Python)
+    if [[ -f "pytest.ini" || -f "pyproject.toml" || -f "setup.py" ]]; then
+        if command -v pytest &>/dev/null; then
+            echo "pytest"
+            return
+        elif command -v python &>/dev/null; then
+            echo "python -m pytest"
+            return
+        fi
+    fi
+
+    # Check Cargo.toml (Rust)
+    if [[ -f "Cargo.toml" ]]; then
+        echo "cargo test"
+        return
+    fi
+
+    # Check go.mod (Go)
+    if [[ -f "go.mod" ]]; then
+        echo "go test ./..."
+        return
+    fi
+
+    # Check Makefile
+    if [[ -f "Makefile" ]]; then
+        if grep -q "^test:" "Makefile"; then
+            echo "make test"
+            return
+        fi
+    fi
+
+    # Check for mix.exs (Elixir)
+    if [[ -f "mix.exs" ]]; then
+        echo "mix test"
+        return
+    fi
+
+    # Check for Gemfile (Ruby)
+    if [[ -f "Gemfile" ]]; then
+        if grep -q "rspec" "Gemfile"; then
+            echo "bundle exec rspec"
+            return
+        elif [[ -d "test" ]]; then
+            echo "bundle exec rake test"
+            return
+        fi
+    fi
+
+    # Check for build.gradle (Java/Kotlin)
+    if [[ -f "build.gradle" || -f "build.gradle.kts" ]]; then
+        echo "./gradlew test"
+        return
+    fi
+
+    # Check for pom.xml (Maven)
+    if [[ -f "pom.xml" ]]; then
+        echo "mvn test"
+        return
+    fi
+
+    # Default: no test command found
+    echo ""
+}
+
+# ============================================================================
+# Context Tracking
+# ============================================================================
+
+# Estimate token count from character count
+estimate_tokens() {
+    local text="$1"
+    local char_count=${#text}
+    echo $((char_count / CHARS_PER_TOKEN))
+}
+
+# Get token limit for a model
+get_token_limit() {
+    local model="$1"
+    case "$model" in
+        haiku)
+            echo $TOKEN_LIMIT_HAIKU
+            ;;
+        sonnet)
+            echo $TOKEN_LIMIT_SONNET
+            ;;
+        opus)
+            echo $TOKEN_LIMIT_OPUS
+            ;;
+        *)
+            echo $TOKEN_LIMIT_SONNET
+            ;;
+    esac
+}
+
+# Check if we're approaching context limit
+check_context_limit() {
+    local content="$1"
+    local model="$2"
+    local threshold="${3:-0.8}"  # 80% by default
+
+    local estimated_tokens
+    estimated_tokens=$(estimate_tokens "$content")
+
+    local limit
+    limit=$(get_token_limit "$model")
+
+    local threshold_tokens
+    threshold_tokens=$(echo "$limit * $threshold" | bc 2>/dev/null || echo $((limit * 8 / 10)))
+
+    if [[ $estimated_tokens -gt $threshold_tokens ]]; then
+        return 0  # True: approaching limit
+    else
+        return 1  # False: still have room
+    fi
+}
+
+# Parse Claude CLI output for context errors
+detect_context_error() {
+    local output="$1"
+
+    # Check for various context limit indicators
+    if echo "$output" | grep -qiE "context.*(limit|window|length|exceeded|full)"; then
+        return 0
+    fi
+    if echo "$output" | grep -qiE "token.*(limit|exceeded|maximum)"; then
+        return 0
+    fi
+    if echo "$output" | grep -qiE "maximum.*(context|length|tokens)"; then
+        return 0
+    fi
+    if echo "$output" | grep -qiE "too (long|large|many tokens)"; then
+        return 0
+    fi
+    if echo "$output" | grep -qiE "input.*truncated"; then
+        return 0
+    fi
+
+    return 1  # No context error detected
 }
 
 # ============================================================================
@@ -954,8 +1124,8 @@ Use the Task tool with Explore subagent to study the codebase structure and patt
                 echo "$output"
             fi
         else
-            # Check for context limit error
-            if echo "$output" | grep -qi "context\|token\|limit"; then
+            # Check for context limit error using improved detection
+            if detect_context_error "$output"; then
                 if [[ "$split_enabled" == "true" ]]; then
                     log_warn "Context limit reached - triggering auto-split"
                     handle_auto_split "$issue" "plan"
@@ -1022,6 +1192,16 @@ cmd_build() {
     local commit_format
     commit_format=$(config_get "build.commit_format" "feat({issue}): {task}")
 
+    # Detect test command
+    local test_command
+    test_command=$(config_get "build.test_command" "")
+    if [[ -z "$test_command" ]]; then
+        test_command=$(detect_test_command)
+        if [[ -n "$test_command" ]]; then
+            log_info "Detected test command: $test_command"
+        fi
+    fi
+
     local iteration=1
     local stuck_count=0
     local split_enabled
@@ -1048,6 +1228,17 @@ cmd_build() {
             break
         fi
 
+        # Check context limit before sending
+        local full_context="$prompt
+
+$plan_content
+
+$(if [[ -f "$progress_file" ]]; then cat "$progress_file"; fi)"
+
+        if check_context_limit "$full_context" "$model" "0.7"; then
+            log_warn "Context is getting large - consider splitting issue"
+        fi
+
         # Prepare the full prompt
         local full_prompt="$prompt
 
@@ -1059,11 +1250,15 @@ $plan_content
 
 $(if [[ -f "$progress_file" ]]; then cat "$progress_file"; else echo "No progress notes yet."; fi)
 
+## Test Command
+
+$(if [[ -n "$test_command" ]]; then echo "Run tests with: $test_command"; else echo "No test command detected - check AGENTS.md or add to .barf.yaml"; fi)
+
 ## Instructions
 
 1. Select the most important incomplete task (marked with [ ])
 2. Implement it completely
-3. Run tests to verify
+3. Run tests to verify: ${test_command:-'(configure in AGENTS.md or .barf.yaml)'}
 4. If tests pass, commit with format: $commit_format
 5. Update the plan file to mark the task as [x]
 6. If stuck, create progress notes and exit
@@ -1096,8 +1291,8 @@ Issue name for commits: $issue"
                 stuck_count=0
             fi
         else
-            # Check for context limit error
-            if echo "$output" | grep -qi "context\|token\|limit"; then
+            # Check for context limit error using improved detection
+            if detect_context_error "$output"; then
                 if [[ "$split_enabled" == "true" ]]; then
                     log_warn "Context limit reached - triggering auto-split"
                     handle_auto_split "$issue" "build"
@@ -1112,6 +1307,272 @@ Issue name for commits: $issue"
 
         ((iteration++))
     done
+}
+
+# ============================================================================
+# Resume Command
+# ============================================================================
+
+cmd_resume() {
+    local issue="${1:-}"
+    local max_iterations="${2:-0}"
+
+    [[ -z "$issue" ]] && die "Usage: barf resume <issue> [max_iterations]"
+
+    require_cmd claude
+
+    # Get plans directory
+    local plans_dir
+    plans_dir=$(config_get "plans.path" "$DEFAULT_PLANS_DIR")
+
+    local plan_file="$plans_dir/${issue}-plan.md"
+    local progress_file="$plans_dir/${issue}-progress.md"
+
+    # Check what exists to determine how to resume
+    if [[ -f "$progress_file" ]]; then
+        log_info "Found progress notes for: $issue"
+        log_info "Resuming from saved progress..."
+
+        # Check if there are sub-issues to work on
+        local sub_issues
+        sub_issues=$(grep -E "^- [a-zA-Z0-9_-]+:" "$progress_file" 2>/dev/null | sed 's/^- \([^:]*\):.*/\1/' || echo "")
+
+        if [[ -n "$sub_issues" ]]; then
+            log_info "Found sub-issues from previous split:"
+            echo "$sub_issues" | while read -r sub; do
+                [[ -n "$sub" ]] && echo "  - $sub"
+            done
+            echo ""
+
+            # Work on first incomplete sub-issue
+            echo "$sub_issues" | while read -r sub_issue; do
+                [[ -z "$sub_issue" ]] && continue
+
+                local sub_plan="$plans_dir/${sub_issue}-plan.md"
+                local sub_status
+                sub_status=$(plugin_call /status "$sub_issue" 2>/dev/null || echo "open")
+
+                if [[ "$sub_status" != "closed" && "$sub_status" != "done" && "$sub_status" != "completed" ]]; then
+                    if [[ ! -f "$sub_plan" ]]; then
+                        log_info "Planning sub-issue: $sub_issue"
+                        cmd_plan "$sub_issue" "$max_iterations"
+                    fi
+
+                    log_info "Building sub-issue: $sub_issue"
+                    cmd_build "$sub_issue" "$max_iterations"
+                    return
+                fi
+            done
+
+            log_success "All sub-issues appear complete!"
+            log_info "Marking parent issue as complete..."
+            plugin_call /status "$issue" "completed" 2>/dev/null || true
+            return
+        fi
+    fi
+
+    # No sub-issues, check for plan
+    if [[ -f "$plan_file" ]]; then
+        # Check if there are incomplete tasks
+        if grep -q "^\[ \]" "$plan_file"; then
+            log_info "Found incomplete tasks in plan, resuming build..."
+            cmd_build "$issue" "$max_iterations"
+        else
+            log_success "All tasks in plan are complete!"
+            plugin_call /status "$issue" "completed" 2>/dev/null || true
+        fi
+    else
+        # No plan exists, start from planning
+        log_info "No plan found, starting from planning phase..."
+        cmd_plan "$issue" "$max_iterations"
+
+        if [[ -f "$plan_file" ]]; then
+            log_info "Plan created, starting build..."
+            cmd_build "$issue" "$max_iterations"
+        fi
+    fi
+}
+
+# ============================================================================
+# List Command
+# ============================================================================
+
+cmd_list() {
+    local filter="${1:-}"
+
+    log_info "Issues:"
+    echo ""
+
+    # Get list from plugin
+    local issues
+    issues=$(plugin_call /list 2>/dev/null) || die "Failed to list issues"
+
+    if [[ -z "$issues" ]]; then
+        echo "  No issues found."
+        return
+    fi
+
+    # Get plans directory for status check
+    local plans_dir
+    plans_dir=$(config_get "plans.path" "$DEFAULT_PLANS_DIR")
+
+    echo "$issues" | while read -r issue_line; do
+        [[ -z "$issue_line" ]] && continue
+
+        # Extract issue name (may include status from plugin)
+        local issue_name
+        issue_name=$(echo "$issue_line" | sed 's/ (.*//')
+
+        # Check for plan and progress
+        local has_plan=""
+        local has_progress=""
+        local task_status=""
+
+        if [[ -f "$plans_dir/${issue_name}-plan.md" ]]; then
+            has_plan="[plan]"
+            # Count tasks
+            local total_tasks
+            local done_tasks
+            total_tasks=$(grep -c "^\[.\]" "$plans_dir/${issue_name}-plan.md" 2>/dev/null || echo "0")
+            done_tasks=$(grep -c "^\[x\]" "$plans_dir/${issue_name}-plan.md" 2>/dev/null || echo "0")
+            if [[ $total_tasks -gt 0 ]]; then
+                task_status="($done_tasks/$total_tasks)"
+            fi
+        fi
+
+        if [[ -f "$plans_dir/${issue_name}-progress.md" ]]; then
+            has_progress="[progress]"
+        fi
+
+        # Apply filter if specified
+        case "$filter" in
+            --planned|planned)
+                [[ -z "$has_plan" ]] && continue
+                ;;
+            --in-progress|in-progress)
+                [[ -z "$has_progress" && -z "$has_plan" ]] && continue
+                ;;
+            --open|open)
+                echo "$issue_line" | grep -qi "closed\|done\|completed" && continue
+                ;;
+            "")
+                # No filter
+                ;;
+        esac
+
+        printf "  %-30s %s %s %s\n" "$issue_line" "$has_plan" "$has_progress" "$task_status"
+    done
+}
+
+# ============================================================================
+# Status Command
+# ============================================================================
+
+cmd_status() {
+    local issue="${1:-}"
+    local new_status="${2:-}"
+
+    if [[ -z "$issue" ]]; then
+        # Show overall status summary
+        log_info "BARF Status Summary"
+        echo ""
+
+        local plans_dir
+        plans_dir=$(config_get "plans.path" "$DEFAULT_PLANS_DIR")
+
+        local issues_dir
+        issues_dir=$(config_get "source.path" "$DEFAULT_ISSUES_DIR")
+
+        # Count issues
+        local total_issues=0
+        local planned_issues=0
+        local in_progress=0
+        local completed_issues=0
+
+        if [[ -d "$issues_dir" ]]; then
+            total_issues=$(find "$issues_dir" -maxdepth 1 -name "*.md" -type f 2>/dev/null | wc -l)
+        fi
+
+        if [[ -d "$plans_dir" ]]; then
+            planned_issues=$(find "$plans_dir" -name "*-plan.md" -type f 2>/dev/null | wc -l)
+            in_progress=$(find "$plans_dir" -name "*-progress.md" -type f 2>/dev/null | wc -l)
+        fi
+
+        echo "  Total issues:     $total_issues"
+        echo "  With plans:       $planned_issues"
+        echo "  In progress:      $in_progress"
+        echo ""
+
+        # Show test command
+        local test_cmd
+        test_cmd=$(detect_test_command)
+        if [[ -n "$test_cmd" ]]; then
+            echo "  Test command:     $test_cmd"
+        else
+            echo "  Test command:     (not detected)"
+        fi
+
+        # Show source type
+        local source_type
+        source_type=$(config_get "source.type" "local")
+        echo "  Issue source:     $source_type"
+
+        return
+    fi
+
+    # Get or set status for specific issue
+    if [[ -z "$new_status" ]]; then
+        # Get status
+        local status
+        status=$(plugin_call /status "$issue" 2>/dev/null) || status="unknown"
+
+        local plans_dir
+        plans_dir=$(config_get "plans.path" "$DEFAULT_PLANS_DIR")
+
+        echo "Issue: $issue"
+        echo "Status: $status"
+
+        # Show plan status if exists
+        if [[ -f "$plans_dir/${issue}-plan.md" ]]; then
+            local total_tasks
+            local done_tasks
+            total_tasks=$(grep -c "^\[.\]" "$plans_dir/${issue}-plan.md" 2>/dev/null || echo "0")
+            done_tasks=$(grep -c "^\[x\]" "$plans_dir/${issue}-plan.md" 2>/dev/null || echo "0")
+            echo "Tasks: $done_tasks/$total_tasks complete"
+
+            # Show incomplete tasks
+            local incomplete
+            incomplete=$(grep "^\[ \]" "$plans_dir/${issue}-plan.md" 2>/dev/null | head -5)
+            if [[ -n "$incomplete" ]]; then
+                echo ""
+                echo "Next tasks:"
+                echo "$incomplete" | while read -r task; do
+                    echo "  $task"
+                done
+            fi
+        fi
+
+        # Show progress notes if exists
+        if [[ -f "$plans_dir/${issue}-progress.md" ]]; then
+            echo ""
+            echo "Progress notes: $plans_dir/${issue}-progress.md"
+
+            # Check for blockers
+            local problem
+            problem=$(sed -n '/^## The Problem/,/^##/p' "$plans_dir/${issue}-progress.md" 2>/dev/null | head -5)
+            if [[ -n "$problem" ]]; then
+                echo ""
+                echo "Current blocker:"
+                echo "$problem" | tail -n +2 | head -3 | while read -r line; do
+                    echo "  $line"
+                done
+            fi
+        fi
+    else
+        # Set status
+        plugin_call /status "$issue" "$new_status"
+        log_success "Status updated: $issue -> $new_status"
+    fi
 }
 
 # ============================================================================
@@ -1299,7 +1760,10 @@ Commands:
   interview <issue>       Analyze issue and ask clarifying questions
   plan <issue> [max]      Generate implementation plan (max iterations)
   build <issue> [max]     Build from plan (max iterations)
+  resume <issue> [max]    Resume work on an issue (auto-detects state)
   audit                   Perform codebase quality audit
+  list [filter]           List all issues (filters: --open, --planned, --in-progress)
+  status [issue] [state]  Show status summary or get/set issue status
 
 Options:
   -h, --help              Show this help
@@ -1310,6 +1774,12 @@ Examples:
   barf interview auth
   barf plan auth 5
   barf build auth 20
+  barf resume auth           # Continue where you left off
+  barf list                  # Show all issues
+  barf list --open           # Show open issues
+  barf status                # Show summary
+  barf status auth           # Show issue status
+  barf status auth done      # Mark issue done
   barf audit
 
 Configuration:
@@ -1345,8 +1815,17 @@ main() {
         build)
             cmd_build "$@"
             ;;
+        resume)
+            cmd_resume "$@"
+            ;;
         audit)
             cmd_audit "$@"
+            ;;
+        list|ls)
+            cmd_list "$@"
+            ;;
+        status|st)
+            cmd_status "$@"
             ;;
         -h|--help|help)
             show_help

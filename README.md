@@ -20,7 +20,13 @@ BARF works with multiple issue sources through a **plugin system**:
 - **Interview Mode** - Scans issues for ambiguities, asks clarifying questions
 - **Planning Mode** - Generates detailed implementation plans with context splitting
 - **Building Mode** - Implements autonomously, saves progress when stuck
+- **Resume Mode** - Continue where you left off (auto-detects state)
 - **Auditing Mode** - Verifies quality and compliance
+
+### Utility Commands
+
+- **`barf list`** - List all issues with plan/progress status
+- **`barf status`** - Show summary or get/set issue status
 
 ## Key Features
 
@@ -60,6 +66,15 @@ Plans include:
 - Specific validation steps
 - Edge cases from acceptance criteria
 
+### Test Command Auto-Detection
+BARF automatically detects how to run tests:
+- `package.json` → `npm test`
+- `pytest.ini` / `pyproject.toml` → `pytest`
+- `Cargo.toml` → `cargo test`
+- `go.mod` → `go test ./...`
+- `Makefile` with `test:` target → `make test`
+- Or specify in `AGENTS.md` or `.barf.yaml`
+
 ## Quick Start
 
 ```bash
@@ -84,7 +99,14 @@ barf plan auth
 # 5. Build autonomously (max 20 iterations)
 barf build auth 20
 
-# 6. Audit quality
+# 6. If interrupted, resume where you left off
+barf resume auth
+
+# 7. Check progress anytime
+barf list                  # List all issues
+barf status auth           # See issue details
+
+# 8. Audit quality
 barf audit
 ```
 
@@ -310,6 +332,78 @@ barf audit
 
 **Output:**
 - `AUDIT_REPORT.md` with prioritized findings
+
+### 5. Resume Mode
+
+Continue where you left off on any issue.
+
+```bash
+barf resume <issue>          # Auto-detect and continue
+barf resume <issue> 20       # Max 20 iterations
+```
+
+**What it does:**
+1. Checks for progress notes and sub-issues
+2. If sub-issues exist: works through them sequentially
+3. If plan exists with incomplete tasks: continues building
+4. If no plan: starts from planning phase
+5. Marks issue complete when done
+
+**Use cases:**
+- After interruption (Ctrl+C, crash, etc.)
+- After auto-split created sub-issues
+- Morning after leaving build running overnight
+- Any time you want to continue work
+
+### 6. List Command
+
+Show all issues with their status.
+
+```bash
+barf list                    # All issues
+barf list --open             # Only open issues
+barf list --planned          # Issues with plans
+barf list --in-progress      # Issues being worked on
+```
+
+**Output format:**
+```
+  auth                         [plan] [progress] (3/5)
+  rate-limiting               [plan] (0/4)
+  user-profiles               (open)
+```
+
+### 7. Status Command
+
+Get summary or manage issue status.
+
+```bash
+barf status                  # Overall summary
+barf status auth             # Detailed issue status
+barf status auth done        # Mark issue as done
+barf status auth open        # Reopen issue
+```
+
+**Summary output:**
+```
+  Total issues:     12
+  With plans:       8
+  In progress:      3
+
+  Test command:     npm test
+  Issue source:     local
+```
+
+**Issue status output:**
+```
+Issue: auth
+Status: open
+Tasks: 3/5 complete
+
+Next tasks:
+  [ ] Implement session persistence
+  [ ] Add logout endpoint
+```
 
 ## File Structure
 
