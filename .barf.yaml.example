@@ -42,11 +42,37 @@ commands:
   link: /link         # Link sub-issue to parent
 
 # ============================================================================
+# Git Branch Automation
+# ============================================================================
+git:
+  # Automatically create and switch to issue-specific branches
+  auto_branch: true
+
+  # Branch naming format
+  # Available placeholders:
+  #   {issue} - Full issue identifier (e.g., "42" or "auth")
+  #   {issue_number} - Numeric portion only
+  # Examples:
+  #   "feat/{issue}" -> feat/42
+  #   "feature/issue-{issue_number}" -> feature/issue-42
+  branch_format: "feat/{issue}"
+
+  # Base branch to create new branches from
+  # If empty, branches from current HEAD
+  base_branch: main
+
+# ============================================================================
 # Output Paths
 # ============================================================================
 plans:
   # Directory for generated plans and progress notes
   path: ./plans
+
+  # Automatically backup plans before regenerating
+  auto_backup: true
+
+  # Show diff when regenerating plans (same as --diff flag)
+  diff_on_regenerate: false
 
 # ============================================================================
 # Auto-Split Settings

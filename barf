@@ -13,6 +13,20 @@ DEFAULT_ISSUES_DIR="./issues"
 DEFAULT_PLANS_DIR="./plans"
 DEFAULT_MAX_RETRIES=3
 TEMPLATES_DIR="${BARF_TEMPLATES_DIR:-$HOME/.barf/templates}"
+BARF_DATA_DIR=".barf"
+STATS_FILE="$BARF_DATA_DIR/stats.json"
+
+# Pricing per million tokens (as of 2024)
+declare -A PRICING_INPUT=(
+    ["opus"]="15.00"
+    ["sonnet"]="3.00"
+    ["haiku"]="0.25"
+)
+declare -A PRICING_OUTPUT=(
+    ["opus"]="75.00"
+    ["sonnet"]="15.00"
+    ["haiku"]="1.25"
+)
 
 # Approximate token limits per model (conservative estimates)
 TOKEN_LIMIT_HAIKU=180000
@@ -341,6 +355,361 @@ parse_yaml_key() {
             fi
         fi
     done < "$file"
+}
+
+# ============================================================================
+# Cost Tracking
+# ============================================================================
+
+# Initialize barf data directory
+init_barf_data() {
+    mkdir -p "$BARF_DATA_DIR"
+    if [[ ! -f "$STATS_FILE" ]]; then
+        echo '{"issues": {}, "total": {"input_tokens": 0, "output_tokens": 0, "api_calls": 0}}' > "$STATS_FILE"
+    fi
+}
+
+# Update stats for an issue
+update_stats() {
+    local issue="$1"
+    local input_tokens="$2"
+    local output_tokens="$3"
+    local model="${4:-sonnet}"
+
+    init_barf_data
+
+    python3 << EOF
+import json
+
+try:
+    with open('$STATS_FILE', 'r') as f:
+        stats = json.load(f)
+except:
+    stats = {"issues": {}, "total": {"input_tokens": 0, "output_tokens": 0, "api_calls": 0}}
+
+issue = "$issue"
+input_tokens = $input_tokens
+output_tokens = $output_tokens
+model = "$model"
+
+if issue not in stats["issues"]:
+    stats["issues"][issue] = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "api_calls": 0,
+        "model_usage": {}
+    }
+
+stats["issues"][issue]["input_tokens"] += input_tokens
+stats["issues"][issue]["output_tokens"] += output_tokens
+stats["issues"][issue]["api_calls"] += 1
+
+if model not in stats["issues"][issue]["model_usage"]:
+    stats["issues"][issue]["model_usage"][model] = {"input": 0, "output": 0, "calls": 0}
+stats["issues"][issue]["model_usage"][model]["input"] += input_tokens
+stats["issues"][issue]["model_usage"][model]["output"] += output_tokens
+stats["issues"][issue]["model_usage"][model]["calls"] += 1
+
+stats["total"]["input_tokens"] += input_tokens
+stats["total"]["output_tokens"] += output_tokens
+stats["total"]["api_calls"] += 1
+
+with open('$STATS_FILE', 'w') as f:
+    json.dump(stats, f, indent=2)
+EOF
+}
+
+# Show stats for an issue or all issues
+show_stats() {
+    local issue="${1:-}"
+
+    init_barf_data
+
+    if [[ ! -f "$STATS_FILE" ]]; then
+        log_warn "No stats recorded yet."
+        return
+    fi
+
+    python3 << EOF
+import json
+import sys
+
+PRICING_INPUT = {"opus": 15.00, "sonnet": 3.00, "haiku": 0.25}
+PRICING_OUTPUT = {"opus": 75.00, "sonnet": 15.00, "haiku": 1.25}
+
+def calc_cost(input_tokens, output_tokens, model="sonnet"):
+    input_price = PRICING_INPUT.get(model, 3.00)
+    output_price = PRICING_OUTPUT.get(model, 15.00)
+    return (input_tokens / 1000000) * input_price + (output_tokens / 1000000) * output_price
+
+def format_tokens(n):
+    if n >= 1000000:
+        return f"{n/1000000:.2f}M"
+    elif n >= 1000:
+        return f"{n/1000:.1f}K"
+    return str(n)
+
+try:
+    with open('$STATS_FILE', 'r') as f:
+        stats = json.load(f)
+except:
+    print("No stats recorded yet.")
+    sys.exit(0)
+
+issue = "$issue"
+
+if issue:
+    if issue not in stats.get("issues", {}):
+        print(f"No stats found for issue '{issue}'")
+        sys.exit(1)
+
+    data = stats["issues"][issue]
+    print(f"\n{'='*60}")
+    print(f"  Cost Tracking for Issue: {issue}")
+    print(f"{'='*60}\n")
+
+    total_cost = 0
+    for model, usage in data.get("model_usage", {}).items():
+        cost = calc_cost(usage["input"], usage["output"], model)
+        total_cost += cost
+
+    print(f"  {'Metric':<25} {'Value':>15}")
+    print(f"  {'-'*25} {'-'*15}")
+    print(f"  {'Input Tokens':<25} {format_tokens(data['input_tokens']):>15}")
+    print(f"  {'Output Tokens':<25} {format_tokens(data['output_tokens']):>15}")
+    print(f"  {'API Calls':<25} {data['api_calls']:>15}")
+    print(f"  {'Estimated Cost':<25} {'$' + f'{total_cost:.4f}':>15}")
+
+    if data.get("model_usage"):
+        print(f"\n  Model Breakdown:")
+        print(f"  {'-'*50}")
+        for model, usage in data["model_usage"].items():
+            model_cost = calc_cost(usage["input"], usage["output"], model)
+            print(f"    {model:<20} {usage['calls']:>5} calls  \${model_cost:.4f}")
+    print()
+else:
+    print(f"\n{'='*60}")
+    print(f"  BARF Cost Tracking Summary")
+    print(f"{'='*60}\n")
+
+    total = stats.get("total", {})
+    print(f"  Overall Statistics:")
+    print(f"  {'-'*50}")
+    print(f"  {'Total Input Tokens':<25} {format_tokens(total.get('input_tokens', 0)):>15}")
+    print(f"  {'Total Output Tokens':<25} {format_tokens(total.get('output_tokens', 0)):>15}")
+    print(f"  {'Total API Calls':<25} {total.get('api_calls', 0):>15}")
+
+    issues = stats.get("issues", {})
+    if issues:
+        print(f"\n  Per-Issue Breakdown:")
+        print(f"  {'-'*50}")
+        print(f"  {'Issue':<15} {'Input':>10} {'Output':>10} {'Calls':>8} {'Cost':>10}")
+        print(f"  {'-'*15} {'-'*10} {'-'*10} {'-'*8} {'-'*10}")
+
+        total_cost = 0
+        for issue_id, data in sorted(issues.items()):
+            issue_cost = 0
+            for model, usage in data.get("model_usage", {}).items():
+                issue_cost += calc_cost(usage["input"], usage["output"], model)
+            total_cost += issue_cost
+
+            print(f"  {issue_id:<15} {format_tokens(data['input_tokens']):>10} {format_tokens(data['output_tokens']):>10} {data['api_calls']:>8} {'\$' + f'{issue_cost:.4f}':>10}")
+
+        print(f"  {'-'*15} {'-'*10} {'-'*10} {'-'*8} {'-'*10}")
+        print(f"  {'TOTAL':<15} {'':<10} {'':<10} {'':<8} {'\$' + f'{total_cost:.4f}':>10}")
+    print()
+EOF
+}
+
+# ============================================================================
+# Plan Diffing
+# ============================================================================
+
+# Generate a diff between old and new plan
+generate_plan_diff() {
+    local issue="$1"
+    local old_plan="$2"
+    local new_plan="$3"
+
+    echo -e "\n${BOLD}Plan Diff for Issue: ${issue}${NC}"
+    echo -e "${DIM}$(printf '%.0s=' {1..60})${NC}\n"
+
+    # Use diff with color
+    diff -u "$old_plan" "$new_plan" 2>/dev/null | while IFS= read -r line; do
+        case "$line" in
+            ---*) echo -e "${RED}$line${NC}" ;;
+            +++*) echo -e "${GREEN}$line${NC}" ;;
+            @@*) echo -e "${CYAN}$line${NC}" ;;
+            -*) echo -e "${RED}$line${NC}" ;;
+            +*) echo -e "${GREEN}$line${NC}" ;;
+            *) echo "$line" ;;
+        esac
+    done || true
+
+    echo -e "\n${DIM}$(printf '%.0s=' {1..60})${NC}"
+
+    local added removed
+    added=$(diff "$old_plan" "$new_plan" 2>/dev/null | grep -c "^>" || echo "0")
+    removed=$(diff "$old_plan" "$new_plan" 2>/dev/null | grep -c "^<" || echo "0")
+
+    echo -e "\n${BOLD}Summary:${NC}"
+    echo -e "  ${GREEN}+ $added lines added${NC}"
+    echo -e "  ${RED}- $removed lines removed${NC}"
+    echo
+}
+
+# Analyze plan changes semantically
+analyze_plan_changes() {
+    local old_plan="$1"
+    local new_plan="$2"
+
+    python3 << EOF
+import re
+
+def extract_tasks(content):
+    tasks = []
+    current_task = None
+    for line in content.split('\n'):
+        if re.match(r'^###\s+Task\s*\d*:?\s*', line):
+            if current_task:
+                tasks.append(current_task)
+            current_task = {'title': line.strip('#').strip(), 'content': ''}
+        elif current_task:
+            current_task['content'] += line + '\n'
+    if current_task:
+        tasks.append(current_task)
+    return tasks
+
+def extract_checklist(content):
+    items = []
+    for line in content.split('\n'):
+        match = re.match(r'^\s*[-*]\s*\[([ xX])\]\s*(.+)', line)
+        if match:
+            checked = match.group(1).lower() == 'x'
+            items.append({'text': match.group(2), 'checked': checked})
+    return items
+
+try:
+    with open('$old_plan', 'r') as f:
+        old_content = f.read()
+    with open('$new_plan', 'r') as f:
+        new_content = f.read()
+except FileNotFoundError as e:
+    print(f"Error: {e}")
+    exit(1)
+
+old_tasks = extract_tasks(old_content)
+new_tasks = extract_tasks(new_content)
+old_checklist = extract_checklist(old_content)
+new_checklist = extract_checklist(new_content)
+
+print("\n\033[1mSemantic Analysis:\033[0m")
+print("-" * 40)
+
+old_titles = {t['title'] for t in old_tasks}
+new_titles = {t['title'] for t in new_tasks}
+added_tasks = new_titles - old_titles
+removed_tasks = old_titles - new_titles
+
+if added_tasks:
+    print(f"\n\033[32mNew Tasks Added ({len(added_tasks)}):\033[0m")
+    for t in added_tasks:
+        print(f"  + {t}")
+
+if removed_tasks:
+    print(f"\n\033[31mTasks Removed ({len(removed_tasks)}):\033[0m")
+    for t in removed_tasks:
+        print(f"  - {t}")
+
+old_items = {i['text'] for i in old_checklist}
+new_items = {i['text'] for i in new_checklist}
+added_items = new_items - old_items
+removed_items = old_items - new_items
+
+if added_items or removed_items:
+    print(f"\n\033[33mChecklist Changes:\033[0m")
+    for item in added_items:
+        print(f"  \033[32m+ {item}\033[0m")
+    for item in removed_items:
+        print(f"  \033[31m- {item}\033[0m")
+
+old_checked = sum(1 for i in old_checklist if i['checked'])
+new_checked = sum(1 for i in new_checklist if i['checked'])
+if old_checked != new_checked:
+    print(f"\n\033[34mProgress: {old_checked} -> {new_checked} tasks completed\033[0m")
+
+if not (added_tasks or removed_tasks or added_items or removed_items):
+    print("\n  No significant structural changes detected.")
+print()
+EOF
+}
+
+# ============================================================================
+# Git Branch Automation
+# ============================================================================
+
+# Get branch name for issue based on configuration
+get_branch_name() {
+    local issue="$1"
+    local format
+    format=$(config_get "git.branch_format" "feat/{issue}")
+
+    local branch_name="${format//\{issue\}/$issue}"
+    local issue_number
+    issue_number=$(echo "$issue" | grep -oE '[0-9]+' | head -1)
+    branch_name="${branch_name//\{issue_number\}/$issue_number}"
+
+    echo "$branch_name"
+}
+
+# Check if git branch automation is enabled
+is_auto_branch_enabled() {
+    local enabled
+    enabled=$(config_get "git.auto_branch" "false")
+    [[ "$enabled" == "true" ]]
+}
+
+# Create and checkout branch for issue
+setup_issue_branch() {
+    local issue="$1"
+
+    if ! is_auto_branch_enabled; then
+        return 0
+    fi
+
+    # Check if we're in a git repo
+    if ! git rev-parse --git-dir > /dev/null 2>&1; then
+        log_verbose "Not a git repository, skipping branch automation"
+        return 0
+    fi
+
+    local branch_name
+    branch_name=$(get_branch_name "$issue")
+
+    local current_branch
+    current_branch=$(git branch --show-current 2>/dev/null || echo "")
+
+    if [[ "$current_branch" == "$branch_name" ]]; then
+        log_verbose "Already on branch: $branch_name"
+        return 0
+    fi
+
+    if git show-ref --verify --quiet "refs/heads/$branch_name" 2>/dev/null; then
+        log_info "Switching to existing branch: $branch_name"
+        git checkout "$branch_name"
+    else
+        log_info "Creating new branch: $branch_name"
+        local base_branch
+        base_branch=$(config_get "git.base_branch" "")
+
+        if [[ -n "$base_branch" ]]; then
+            git checkout -b "$branch_name" "$base_branch"
+        else
+            git checkout -b "$branch_name"
+        fi
+    fi
+
+    log_success "Branch ready: $branch_name"
 }
 
 # ============================================================================
@@ -1032,12 +1401,23 @@ PLUGIN_EOF
 # Interview Command
 # ============================================================================
 
+cmd_stats() {
+    local issue="${1:-}"
+
+    print_header "BARF Cost Tracking"
+
+    show_stats "$issue"
+}
+
 cmd_interview() {
     local issue="${1:-}"
 
     [[ -z "$issue" ]] && die "Usage: barf interview <issue>"
 
     require_cmd claude
+
+    # Setup branch if auto_branch enabled
+    setup_issue_branch "$issue"
 
     log_info "Starting interview for: $issue"
 
@@ -1083,12 +1463,34 @@ Analyze this issue and identify any ambiguities or missing information. Ask clar
 # ============================================================================
 
 cmd_plan() {
-    local issue="${1:-}"
-    local max_iterations="${2:-0}"
+    local issue=""
+    local max_iterations="0"
+    local show_diff=false
 
-    [[ -z "$issue" ]] && die "Usage: barf plan <issue> [max_iterations]"
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --diff|-d)
+                show_diff=true
+                shift
+                ;;
+            *)
+                if [[ -z "$issue" ]]; then
+                    issue="$1"
+                elif [[ "$max_iterations" == "0" ]]; then
+                    max_iterations="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    [[ -z "$issue" ]] && die "Usage: barf plan <issue> [max_iterations] [--diff]"
 
     require_cmd claude
+
+    # Setup branch if auto_branch enabled
+    setup_issue_branch "$issue"
 
     log_info "Starting planning for: $issue"
 
@@ -1102,6 +1504,24 @@ cmd_plan() {
     mkdir -p "$plans_dir"
 
     local plan_file="$plans_dir/${issue}-plan.md"
+    local backup_file=""
+
+    # Check for existing plan and backup if --diff
+    if [[ -f "$plan_file" ]]; then
+        if [[ "$show_diff" == true ]]; then
+            backup_file="$plans_dir/.${issue}-plan.backup.md"
+            cp "$plan_file" "$backup_file"
+            log_info "Backed up existing plan for diff comparison"
+        else
+            # Check config for auto_backup
+            local auto_backup
+            auto_backup=$(config_get "plans.auto_backup" "true")
+            if [[ "$auto_backup" == "true" ]]; then
+                backup_file="$plans_dir/.${issue}-plan.backup.md"
+                cp "$plan_file" "$backup_file"
+            fi
+        fi
+    fi
 
     # Select model for planning (complex for better reasoning)
     local model
@@ -1158,6 +1578,16 @@ Use the Task tool with Explore subagent to study the codebase structure and patt
             # Check if plan file was created
             if [[ -f "$plan_file" ]]; then
                 log_success "Plan generated: $plan_file"
+
+                # Show diff if requested and backup exists
+                if [[ "$show_diff" == true && -n "$backup_file" && -f "$backup_file" ]]; then
+                    generate_plan_diff "$issue" "$backup_file" "$plan_file"
+                    analyze_plan_changes "$backup_file" "$plan_file"
+                    rm -f "$backup_file"
+                elif [[ "$show_diff" == true ]]; then
+                    log_warn "No previous plan to compare against"
+                fi
+
                 break
             else
                 log_warn "Plan file not created, Claude output:"
@@ -1202,6 +1632,9 @@ cmd_build() {
     [[ -z "$issue" ]] && die "Usage: barf build <issue> [max_iterations]"
 
     require_cmd claude
+
+    # Setup branch if auto_branch enabled
+    setup_issue_branch "$issue"
 
     log_info "Starting build for: $issue"
 
@@ -2284,9 +2717,11 @@ ${BOLD}COMMANDS:${NC}
   init                    Initialize BARF in current directory
   interview <issue>       Analyze issue and ask clarifying questions
   plan <issue> [max]      Generate implementation plan (max iterations)
+    --diff, -d            Show diff from previous plan when regenerating
   build <issue> [max]     Build from plan (max iterations)
   resume <issue> [max]    Resume work on an issue (auto-detects state)
   audit                   Perform codebase quality audit
+  stats [issue]           Show cost tracking statistics
   list [filter]           List all issues (filters: --open, --planned, --in-progress)
   status [issue] [state]  Show status summary or get/set issue status
   new <type> <title>      Create new issue from template
@@ -2305,11 +2740,14 @@ ${BOLD}EXAMPLES:${NC}
   barf init
   barf interview auth
   barf plan auth 5
+  barf plan auth --diff            # Regenerate plan and show diff
   barf plan auth --dry-run         # Show what plan would do
   barf build auth 20
   barf build auth --dry-run        # Show next task without implementing
   barf -m sonnet build auth        # Use Sonnet model for speed
   barf resume auth                 # Continue where you left off
+  barf stats                       # Show all cost tracking stats
+  barf stats auth                  # Show cost stats for issue
   barf list                        # Show all issues
   barf list --open                 # Show open issues
   barf status                      # Show summary
@@ -2334,6 +2772,21 @@ ${BOLD}DRY-RUN MODE:${NC}
 ${BOLD}CONFIGURATION:${NC}
   Create .barf.yaml in your project root to customize behavior.
   See .barf.yaml.example for all options.
+
+${BOLD}GIT BRANCH AUTOMATION:${NC}
+  Add to .barf.yaml to auto-create branches per issue:
+
+    git:
+      auto_branch: true
+      branch_format: "feat/{issue}"
+      base_branch: main
+
+  Placeholders: {issue}, {issue_number}
+
+${BOLD}COST TRACKING:${NC}
+  BARF tracks Claude API usage per issue. View with:
+    barf stats          # All issues
+    barf stats auth     # Specific issue
 
 ${BOLD}DOCUMENTATION:${NC}
   https://github.com/brewpirate/barf
@@ -2440,6 +2893,9 @@ main() {
             ;;
         audit)
             cmd_audit "${args[@]:-}"
+            ;;
+        stats)
+            cmd_stats "${args[@]:-}"
             ;;
         list|ls)
             cmd_list "${args[@]:-}"
