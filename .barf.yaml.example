@@ -1,76 +1,117 @@
-# BARF Configuration Example
-# Copy this to .barf.yaml and customize for your project
+# BARF Configuration
+# Copy this to .barf.yaml in your project root
 
-# Default model for all operations
-# Options: claude-opus-4-5-20250514, claude-sonnet-4-20250514, claude-haiku-4-20250514
-# Shortcuts in CLI: opus, sonnet, haiku
-model: claude-opus-4-5-20250514
+# ============================================================================
+# Issue Source Plugin
+# ============================================================================
+source:
+  # Plugin type: local | github | gitlab | custom
+  type: local
 
-# Git automation settings
-git:
-  # Automatically create and switch to issue-specific branches
-  auto_branch: true
+  # For local plugin: directory containing issue markdown files
+  path: ./issues
 
-  # Branch naming format
-  # Available placeholders:
-  #   {issue} - Full issue identifier (e.g., "42" or "auth")
-  #   {issue_number} - Numeric portion only
-  # Examples:
-  #   "feat/{issue}" -> feat/42
-  #   "feature/issue-{issue_number}" -> feature/issue-42
-  #   "dev/{issue}" -> dev/auth
-  branch_format: "feat/{issue}"
+  # For github/gitlab plugins: repository identifier
+  # repo: owner/repo
 
-  # Base branch to create new branches from
-  # If empty, branches from current HEAD
-  base_branch: main
+  # For custom plugins: path to plugin script
+  # plugin: ./plugins/custom.sh
 
-# Cost tracking settings
-tracking:
-  # Enable/disable cost tracking
+# ============================================================================
+# Issue Referencing
+# ============================================================================
+issues:
+  # How issues are referenced in commands
+  # filename: barf plan my-feature (references issues/my-feature.md)
+  # number: barf plan 42 (references issues/42.md or GitHub issue #42)
+  reference: filename
+
+# ============================================================================
+# Plugin Commands
+# ============================================================================
+# These define the interface between BARF and issue source plugins.
+# Customize if your plugin uses different command names.
+commands:
+  fetch: /fetch       # Get issue content
+  update: /update     # Update issue content
+  comment: /comment   # Add comment to issue
+  context: /context   # Get full context (issue + comments)
+  status: /status     # Get or set issue status
+  list: /list         # List all issues
+  create: /create     # Create new issue
+  link: /link         # Link sub-issue to parent
+
+# ============================================================================
+# Output Paths
+# ============================================================================
+plans:
+  # Directory for generated plans and progress notes
+  path: ./plans
+
+# ============================================================================
+# Auto-Split Settings
+# ============================================================================
+split:
+  # Enable automatic issue splitting when context fills up
   enabled: true
 
-  # Warn when an issue's cost exceeds this threshold (in USD)
-  warn_threshold: 5.00
+  # Maximum retry attempts before forcing a split
+  max_retries: 3
 
-  # Show cost summary after each operation
-  show_summary: true
+  # Naming pattern for sub-issues
+  # {issue} = original issue name, {n} = part number
+  pattern: "{issue}-part{n}"
 
-# Plan generation settings
-plans:
-  # Automatically backup plans before regenerating
-  auto_backup: true
+# ============================================================================
+# Model Selection (Auto)
+# ============================================================================
+# BARF automatically selects the best model per task.
+# Override only if needed.
+models:
+  # Quick lookups, simple analysis
+  fast: haiku
 
-  # Show diff when regenerating plans (same as --diff flag)
-  diff_on_regenerate: true
+  # Planning, code generation
+  default: sonnet
 
-  # Maximum tasks per plan (recommends split if exceeded)
-  max_tasks: 15
+  # Complex reasoning, architecture decisions
+  complex: opus
 
-# Interview mode settings
-interview:
-  # Automatically post clarifying questions as issue comments
-  auto_comment: true
-
-  # Label to add when interview is complete
-  clarified_label: "clarified"
-
-# Build mode settings
+# ============================================================================
+# Build Settings
+# ============================================================================
 build:
-  # Maximum retries when stuck on same task
-  max_stuck_retries: 3
-
-  # Automatically run tests after each task
-  auto_test: true
-
   # Commit message format
-  # Placeholders: {issue}, {task}
-  commit_format: "feat(#{issue}): {task}"
+  # {issue} = issue name, {task} = task description
+  commit_format: "feat({issue}): {task}"
 
-# Audit mode settings
+  # Run tests after each task (backpressure)
+  run_tests: true
+
+  # Test command (auto-detected from AGENTS.md if not specified)
+  # test_command: npm test
+
+# ============================================================================
+# Interview Settings
+# ============================================================================
+interview:
+  # Automatically update issue with clarifications
+  auto_update: true
+
+  # Add clarifications as comments (true) or edit issue body (false)
+  use_comments: true
+
+# ============================================================================
+# Audit Settings
+# ============================================================================
 audit:
-  # Include test coverage analysis
-  include_coverage: true
-
   # Output file for audit report
-  output_file: "AUDIT_REPORT.md"
+  output: ./AUDIT_REPORT.md
+
+  # Checks to run
+  checks:
+    - code_quality
+    - issue_compliance
+    - test_coverage
+    - technical_debt
+    - consistency
